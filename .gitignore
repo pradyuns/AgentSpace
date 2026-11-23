@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+.DS_Store
+*.xcodeproj/
+*.xcworkspace/
+Evals/results/*
+!Evals/results/.gitkeep
+__pycache__/

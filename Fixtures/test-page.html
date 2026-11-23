@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentSpace Fixture</title>
+<style>
+body {font: 18px system-ui; margin: 32px; max-width: 800px}
+label {display: block; margin: 16px 0}
+input, textarea, button {font: inherit}
+.long {height: 4000px; background: linear-gradient(#eef5ff, #c8e5f5); padding: 20px}
+#bottom-marker {padding: 30px; background: #d4f5d9}
+</style>
+<h1>AgentSpace disposable form</h1>
+<label>Probe input <input id="probe-input" aria-label="Probe input"></label>
+<label>Probe textarea <textarea id="probe-textarea" aria-label="Probe textarea"></textarea></label>
+<button id="probe-button" onclick="document.getElementById('result-label').textContent='Button clicked';this.textContent='Clicked'">Probe button</button>
+<p id="result-label" role="status" aria-live="polite">Not clicked</p>
+<label><input type="checkbox" aria-label="Probe checkbox"> Probe checkbox</label>
+<a href="#bottom-marker">Jump to bottom</a>
+<div class="long">Long scroll content. No external resources or network requests.</div>
+<button id="bottom-marker">Bottom marker: not reached</button>
+<script>
+new IntersectionObserver(entries => {
+  if (entries.some(entry => entry.isIntersecting)) {
+    document.getElementById('bottom-marker').textContent = 'Bottom marker: reached';
+  }
+}).observe(document.getElementById('bottom-marker'));
+</script>
+</html>

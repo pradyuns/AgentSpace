@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>AgentSpace interactions</title>
+<style>
+body { margin: 24px; font: 18px system-ui; }
+label { display: block; margin-bottom: 16px; }
+#slider { width: 300px; }
+#hover { width: 300px; height: 60px; background: #d4f5d9; }
+#scroll { width: 300px; height: 120px; overflow: auto; background: #eef5ff; }
+#scroll > div { height: 1200px; }
+output { display: block; margin: 12px 0; }
+</style>
+<h1>AgentSpace interactions</h1>
+<label>Probe input <input aria-label="Probe input" id="input"></label>
+<output id="typed">typed=</output>
+<label>Drag slider <input type="range" aria-label="Drag slider" id="slider" min="0" max="100" value="0"></label>
+<output id="dragged">slider=0</output>
+<div id="hover">Hover target</div>
+<output id="hovered">hovered=false</output>
+<div id="scroll" tabindex="0" aria-label="Scroll area"><div>Scroll here</div></div>
+<output id="scrolled">scrollTop=0</output>
+<script>
+const input = document.querySelector('#input');
+const slider = document.querySelector('#slider');
+const hover = document.querySelector('#hover');
+const scroll = document.querySelector('#scroll');
+function update() {
+  document.querySelector('#typed').textContent = 'typed=' + input.value;
+  document.querySelector('#dragged').textContent = 'slider=' + slider.value;
+  document.querySelector('#scrolled').textContent = 'scrollTop=' + scroll.scrollTop;
+  document.title = 'typed=' + input.value + ';slider=' + slider.value + ';' +
+    document.querySelector('#hovered').textContent + ';scrollTop=' + scroll.scrollTop;
+}
+input.addEventListener('input', update);
+slider.addEventListener('input', update);
+hover.addEventListener('pointerenter', () => {
+  document.querySelector('#hovered').textContent = 'hovered=true';
+  update();
+});
+scroll.addEventListener('scroll', update);
+update();
+</script>
+</html>
