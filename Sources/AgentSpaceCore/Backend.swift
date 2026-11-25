@@ -285,13 +285,17 @@ public enum BackendRouter {
 /// `flags` the boolean options, and `common` the options every command accepts.
 public enum AgentSpaceCommands {
     public static let commands: Set<String> = ["prepare", "create-workspace", "launch-app", "target-window", "observe",
-        "click", "type-text", "key", "scroll", "move", "drag", "self-test", "get-status", "stop-workspace", "list-workspaces"]
+        "click", "type-text", "key", "scroll", "move", "drag", "self-test", "get-status", "stop-workspace", "list-workspaces",
+        "session-handoff", "session-resume"]
     public static let common: Set<String> = ["workspace"]
     public static let selectors: Set<String> = ["ref", "role", "title", "label", "value-contains", "index"]
     public static let allowed: [String: Set<String>] = [
         "prepare": ["url", "file", "restore-focus", "chrome-launch-strategy", "backend", "interaction"],
         "create-workspace": ["backend", "interaction"],
-        "launch-app": ["app", "url", "file", "format", "restore-focus", "chrome-launch-strategy", "backend", "interaction", "preset"],
+        "launch-app": ["app", "url", "file", "format", "restore-focus", "chrome-launch-strategy", "backend", "interaction", "preset",
+                       "chrome-session", "profile", "site", "expected-account"],
+        "session-handoff": [],
+        "session-resume": [],
         "target-window": ["pid", "title", "index", "window"],
         "observe": ["screenshot", "depth", "max-nodes"],
         "click": selectors.union(["x", "y", "button", "count", "modifiers"]),

@@ -60,7 +60,10 @@ public func uint32Field(_ value: JSONValue, _ key: String) -> UInt32? {
 public struct AgentSpaceError: Error, CustomStringConvertible, Sendable {
     public let code: String
     public let description: String
-    public init(_ code: String, _ description: String) { self.code = code; self.description = description }
+    public let details: JSONValue?
+    public init(_ code: String, _ description: String, details: JSONValue? = nil) {
+        self.code = code; self.description = description; self.details = details
+    }
 }
 
 public struct ElementRef: Equatable, Sendable {
@@ -173,6 +176,12 @@ public struct Workspace: Codable, Equatable, Sendable {
     /// Set by `stop-workspace --abandon-session`: the session record AgentSpace gave up on
     /// reaching. Presence means the session may still exist - it is never claimed destroyed.
     public var abandonedVirtualDisplay: VirtualDisplayState?
+    /// Opt-in Chrome session reference: session id + broker identity only.
+    /// Target ids, credentials and page content live exclusively in the
+    /// session broker's journal - never in the workspace.
+    public var chromeSession: ChromeSessionRef?
+    /// `stop-workspace --abandon-session` echo of a dropped chrome session.
+    public var abandonedChromeSession: ChromeSessionRef?
     public init(name: String, temporaryDirectory: String) {
         self.name=name; self.temporaryDirectory=temporaryDirectory; createdAt=Date()
         apps=[]; target=nil; stopped=false

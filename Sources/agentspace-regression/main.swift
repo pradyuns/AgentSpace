@@ -11,6 +11,31 @@ import Foundation
 
 signal(SIGPIPE, SIG_IGN)
 
+if CommandLine.arguments == [CommandLine.arguments[0], "--print-access-probe"] {
+    print(SiteAccess.evidenceExpression)
+    exit(0)
+}
+
+if CommandLine.arguments.count == 4, CommandLine.arguments[1] == "--cdp-socket-probe",
+   let url = URL(string: CommandLine.arguments[2]) {
+    let mode = CommandLine.arguments[3]
+    let socket = CDPSocket(endpoint: url)
+    do {
+        if mode == "unresolved" {
+            _ = try await ChromeEndpoint.identify(transport: socket, endpoint: url, guid: "socket-test", timeout: 0.3)
+        } else {
+            for index in 1...(mode == "immediate" ? 250 : 1) {
+                let reply = try await socket.send("Target.createTarget", params: [:], sessionId: nil, timeout: 2)
+                guard int32Field(reply, "receipt") == Int32(index) else { throw AgentSpaceError("receipt_lost", "wrong socket receipt") }
+            }
+        }
+        print("receipts-preserved")
+    } catch let error as AgentSpaceError { print(error.code) }
+    catch { print(String(describing: error)) }
+    await socket.close()
+    exit(0)
+}
+
 nonisolated(unsafe) var passed = 0
 nonisolated(unsafe) var failed = 0
 nonisolated(unsafe) var failures: [String] = []
@@ -544,6 +569,514 @@ do {
     check("janitor exits the host when its socket disappears",
           process.terminationReason == .exit && process.terminationStatus == 0,
           "status \(process.terminationStatus)")
+}
+
+// MARK: 14. Chrome session broker - scripted CDP transport
+
+final class ScriptedTransport: CDPTransport, @unchecked Sendable {
+    struct Call { var method: String; var params: [String: JSONValue]; var sessionId: String? }
+    private let lock = NSLock()
+    private var _calls: [Call] = []
+    var calls: [Call] { lock.withLock { _calls } }
+    var responder: (String, [String: JSONValue], String?) -> JSONValue
+    private var continuation: AsyncStream<CDPEvent>.Continuation?
+    let events: AsyncStream<CDPEvent>
+    init(responder: @escaping (String, [String: JSONValue], String?) -> JSONValue) {
+        self.responder = responder
+        var cont: AsyncStream<CDPEvent>.Continuation!
+        events = AsyncStream { cont = $0 }
+        continuation = cont
+    }
+    func send(_ method: String, params: [String: JSONValue], sessionId: String?,
+              timeout: TimeInterval) async throws -> JSONValue {
+        lock.withLock { _calls.append(Call(method: method, params: params, sessionId: sessionId)) }
+        return responder(method, params, sessionId)
+    }
+    func push(_ method: String, _ params: JSONValue, sessionId: String?) {
+        continuation?.yield(CDPEvent(method: method, params: params, sessionId: sessionId))
+    }
+    func finish() { continuation?.finish() }
+    func close() async { continuation?.finish() }
+    func sent(_ method: String) -> [Call] { calls.filter { $0.method == method } }
+    func last(_ method: String) -> Call? { calls.last { $0.method == method } }
+}
+
+final class OrderLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [String] = []
+    func add(_ entry: String) { lock.withLock { entries.append(entry) } }
+    func snapshot() -> [String] { lock.withLock { entries } }
+}
+
+final class FakePage: @unchecked Sendable {
+    var visible = false
+    var passwordFocus = false
+    var evidence: JSONValue = .null
+}
+
+func scriptedAXTree() -> JSONValue {
+    func node(_ id: Int, _ role: String, _ name: String) -> JSONValue {
+        .object(["backendDOMNodeId": .number(Double(id)), "ignored": .bool(false),
+                 "role": .object(["value": .string(role)]),
+                 "name": .object(["value": .string(name)]),
+                 "properties": .array([])])
+    }
+    return .object(["nodes": .array([
+        node(5, "textbox", "Search"), node(6, "button", "Go"), node(7, "link", "Docs")])])
+}
+
+do {
+    let dir = NSTemporaryDirectory() + "asr-session-\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12))"
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
+                                            attributes: [.posixPermissions: 0o700])
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let guid = "test-guid-0001"
+    try Data("43000\n/devtools/browser/\(guid)\n".utf8)
+        .write(to: URL(fileURLWithPath: dir + "/DevToolsActivePort"))
+    let identity = BrowserIdentity(endpoint: "ws://127.0.0.1:43000/devtools/browser/\(guid)",
+                                   guid: guid, browser: ProcessIdentity(pid: 4242, start: 500))
+
+    let order = OrderLog()
+    let page = FakePage()
+    page.evidence = .object([
+        "url": .string("http://localhost:8080/"), "host": .string("localhost"),
+        "title": .string("Fixture"), "password": .bool(false), "loginPath": .bool(false),
+        "fixtureSignedIn": .bool(true), "fixtureAccount": .string("alice@fixture.io")])
+    final class Ids { var n = 0; var closed = false }
+    let ids = Ids()
+    let transport = ScriptedTransport { method, params, sessionId in
+        order.add("send:\(method)")
+        switch method {
+        case "Target.createTarget":
+            ids.n += 1
+            return .object(["targetId": .string("T-OWNED-\(ids.n)")])
+        case "Target.attachToTarget":
+            return .object(["sessionId": .string("S-OWNED-\(ids.n)")])
+        case "Page.navigate": return .object([:])
+        case "Page.addScriptToEvaluateOnNewDocument": return .object(["identifier": .string("policy-1")])
+        case "Target.closeTarget": ids.closed = true; return .object(["success": .bool(true)])
+        case "Target.getTargets":
+            return .object(["targetInfos": .array(ids.closed ? [] : [.object(["targetId": .string("T-OWNED-1")])])])
+        case "Runtime.evaluate":
+            let expr = stringField(.object(params), "expression") ?? ""
+            if expr.contains("visibilityState") {
+                return .object(["result": .object(["value": .string(page.visible ? "visible" : "hidden")])])
+            }
+            if expr.contains("fixtureSignedIn") || expr.contains("gmailMain") {
+                return .object(["result": .object(["value": page.evidence])])
+            }
+            if expr.contains("readyState") {
+                return .object(["result": .object(["value": .bool(true)])])
+            }
+            if expr.contains("activeElement") {
+                return .object(["result": .object(["value": page.passwordFocus
+                    ? .object(["type": .string("password"), "tag": .string("INPUT")])
+                    : .object(["type": .string("text"), "tag": .string("INPUT")])])])
+            }
+            if expr.contains("scroll") || expr.hasPrefix("scrollY") || expr.hasPrefix("scrollX") {
+                return .object(["result": .object(["value": .number(0)])])
+            }
+            return .object(["result": .object(["value": .null])])
+        case "Accessibility.getFullAXTree": return scriptedAXTree()
+        case "DOM.resolveNode": return .object(["object": .object(["objectId": .string("obj-1")])])
+        case "Runtime.callFunctionOn":
+            let fn = stringField(.object(params), "functionDeclaration") ?? ""
+            if fn.contains("getBoundingClientRect") {
+                return .object(["result": .object(["value": .object(["x": .number(10), "y": .number(20)])])])
+            }
+            if fn.contains("this.type") {
+                return .object(["result": .object(["value": .object(["type": .string(page.passwordFocus ? "password" : "text"), "tag": .string("INPUT")])])])
+            }
+            return .object(["result": .object(["value": .string("alice")])])
+        default: return .object([:])
+        }
+    }
+
+    let core = try SessionCore(config: SessionCore.Config(
+        brokerKey: "sb-test", mode: .shared,
+        chromeRoot: URL(fileURLWithPath: dir), brokerDir: URL(fileURLWithPath: dir),
+        probe: DisplayHost.Probe(startTime: { _ in 500 }, signal: { _, _ in 0 }),
+        onJournalSaved: { journal in
+            order.add("journal:\(journal.sessions.values.flatMap(\.targets).count)-targets")
+        }))
+    try await core.adoptTransport(transport, identity: identity, ownedByBroker: false)
+
+    let open = try await core.handle("open", .object([
+        "requestId": .string("r1"), "session": .string("s1"),
+        "url": .string("http://localhost:8080/"), "site": .string("fixture"),
+        "expectedAccount": .string("alice@fixture.io")]))
+    check("session open returns ok + session summary",
+          field(open, "ok") == .bool(true) && field(open, "session") != .null)
+    let create = transport.last("Target.createTarget")
+    check("createTarget is a fresh background about:blank",
+          create != nil
+            && field(.object(create!.params), "url") == .string("about:blank")
+            && field(.object(create!.params), "background") == .bool(true))
+    check("no browserContextId on a shared target",
+          field(.object(create!.params), "browserContextId") == .null)
+    let attach = transport.last("Target.attachToTarget")
+    check("attach is flatten-mode on the receipt id",
+          attach != nil && field(.object(attach!.params), "targetId") == .string("T-OWNED-1")
+            && field(.object(attach!.params), "flatten") == .bool(true))
+    let autoAttach = transport.last("Target.setAutoAttach")
+    check("auto-attach waits for debugger start on the page session",
+          autoAttach != nil && autoAttach!.sessionId == "S-OWNED-1"
+            && field(.object(autoAttach!.params), "waitForDebuggerOnStart") == .bool(true))
+    check("shared mode arms Fetch interception on the page session",
+          transport.last("Fetch.enable")?.sessionId == "S-OWNED-1")
+    let calls = order.snapshot()
+    let navIndex = calls.firstIndex(of: "send:Page.navigate") ?? -1
+    let journalIndex = calls.firstIndex(of: "journal:1-targets") ?? -1
+    check("target was journaled before navigate",
+          journalIndex >= 0 && navIndex > journalIndex, "\(calls)")
+    let forbidden: Set<String> = ["Browser.close",
+                                  "Browser.setDownloadBehavior", "Browser.grantPermissions",
+                                  "Network.setCookies", "Storage.getCookies"]
+    check("no forbidden protocol methods so far",
+          transport.calls.allSatisfy { !forbidden.contains($0.method) },
+          "\(transport.calls.map { $0.method })")
+    var journal = await core.journalSnapshot
+    check("identity verified by supported-site readback",
+          stringField(field(open, "access"), "identity") == "verified"
+            && stringField(field(open, "access"), "access") == "accessible")
+    let journalData = try Data(contentsOf: URL(fileURLWithPath: dir + "/journal.json"))
+    check("expected account is a digest, never plaintext",
+          !String(decoding: journalData, as: UTF8.self).contains("alice@fixture.io"))
+    let replay = try await core.handle("open", .object([
+        "requestId": .string("r1"), "session": .string("s1"),
+        "url": .string("http://localhost:8080/"), "site": .string("fixture"),
+        "expectedAccount": .string("alice@fixture.io")]))
+    let changedConstraint = try? await core.handle("open", .object([
+        "requestId": .string("r1"), "session": .string("s1"), "url": .string("http://localhost:8080/"),
+        "site": .string("fixture"), "expectedAccount": .string("bob@fixture.io")]))
+    check("an open replay cannot silently replace its account constraint", changedConstraint == nil)
+    check("open replay is idempotent",
+          field(replay, "idempotent") == .bool(true)
+            && transport.sent("Target.createTarget").count == 1)
+    let obs = try await core.handle("perform", .object([
+        "session": .string("s1"), "command": .string("observe"),
+        "options": .object(["limit": .number(100), "depth": .number(5)])]))
+    check("observe returns a tree from the owned page",
+          field(obs, "ok") == .bool(true) && field(obs, "tree") != .null)
+    transport.push("Target.attachedToTarget", .object([
+        "targetInfo": .object(["targetId": .string("USER-CHILD"), "type": .string("page"),
+                               "openerId": .string("USER-TAB")]),
+        "sessionId": .string("S-USER-1")]), sessionId: "S-OWNED-1")
+    try await Task.sleep(for: .milliseconds(150))
+    check("foreign page attachment is released, never adopted or closed",
+          !transport.sent("Target.closeTarget").contains { field(.object($0.params), "targetId") == .string("USER-CHILD") }
+            && transport.sent("Runtime.runIfWaitingForDebugger").contains { $0.sessionId == "S-USER-1" })
+    transport.push("Fetch.requestPaused", .object([
+        "requestId": .string("rq-1"),
+        "responseHeaders": .array([.object(["name": .string("Content-Disposition"),
+                                            "value": .string("attachment; filename=a.bin")])])]),
+        sessionId: "S-OWNED-1")
+    transport.push("Fetch.requestPaused", .object([
+        "requestId": .string("rq-2"), "responseHeaders": .array([])]), sessionId: "S-OWNED-1")
+    try await Task.sleep(for: .milliseconds(200))
+    check("attachment response is failed per-request",
+          transport.sent("Fetch.failRequest").contains {
+              field(.object($0.params), "requestId") == .string("rq-1") })
+    check("ordinary response continues",
+          transport.sent("Fetch.continueRequest").contains {
+              field(.object($0.params), "requestId") == .string("rq-2") })
+    journal = await core.journalSnapshot
+    check("blocked download counted", journal.sessions["s1"]?.downloadsBlocked == 1)
+    let open2 = try await core.handle("open", .object([
+        "requestId": .string("r2"), "session": .string("s2"),
+        "url": .string("http://localhost:8080/two"), "site": .string("fixture")]))
+    check("second session opens its own owned target",
+          field(open2, "ok") == .bool(true))
+    transport.push("Target.detachedFromTarget", .object(["sessionId": .string("S-GHOST")]),
+                   sessionId: nil)
+    transport.push("Target.targetDestroyed", .object(["targetId": .string("T-FOREIGN")]),
+                   sessionId: nil)
+    transport.push("Fetch.requestPaused", .object([
+        "requestId": .string("rq-foreign"), "responseHeaders": .array([
+            .object(["name": .string("Content-Disposition"),
+                     "value": .string("attachment; filename=x.bin")])])]),
+        sessionId: "S-GHOST")
+    try await Task.sleep(for: .milliseconds(150))
+    check("foreign detach/destroy/paused events are ignored",
+          !transport.sent("Fetch.failRequest").contains {
+              field(.object($0.params), "requestId") == .string("rq-foreign") }
+            && !transport.sent("Fetch.continueRequest").contains {
+                field(.object($0.params), "requestId") == .string("rq-foreign") })
+    journal = await core.journalSnapshot
+    check("foreign events mutate no owned state",
+          journal.sessions["s1"]?.targets.last?.state == .open
+            && journal.sessions["s2"]?.targets.last?.state == .open
+            && journal.sessions["s1"]?.downloadsBlocked == 1)
+    let obs2 = try await core.handle("perform", .object([
+        "session": .string("s1"), "command": .string("observe"), "options": .object([:])]))
+    check("owned session unaffected by foreign events",
+          field(obs2, "ok") == .bool(true))
+    transport.push("Target.targetDestroyed", .object(["targetId": .string("T-OWNED-2")]),
+                   sessionId: nil)
+    try await Task.sleep(for: .milliseconds(150))
+    journal = await core.journalSnapshot
+    check("user-closed owned target is journaled closed",
+          journal.sessions["s2"]?.targets.last?.state == .closed)
+    let goneTarget = try? await core.handle("perform", .object([
+        "session": .string("s2"), "command": .string("observe"), "options": .object([:])]))
+    check("dead owned target reports session_target_gone",
+          goneTarget == nil || field(goneTarget!, "ok") != .bool(true))
+    let close2 = try await core.handle("close-session", .object(["session": .string("s2")]))
+    check("close-session on user-closed tab confirms cleanup honestly",
+          field(close2, "cleanupConfirmed") == .bool(true)
+            && arrayField(close2, "uncertainTargets").isEmpty)
+    page.passwordFocus = true
+    let pwType = try? await core.handle("perform", .object([
+        "session": .string("s1"), "command": .string("type-text"),
+        "options": .object(["ref": .string("0.5"), "text": .string("hunter2")])]))
+    check("password-field typing refused (throws password_input_refused)",
+          pwType == nil)
+    check("no text was inserted after refusal",
+          !transport.sent("Input.insertText").contains {
+              field(.object($0.params), "text") == .string("hunter2") })
+    page.passwordFocus = false
+    let handoff = try await core.handle("handoff", .object(["session": .string("s1")]))
+    check("handoff activates the owned target",
+          field(handoff, "ok") == .bool(true)
+            && transport.last("Target.activateTarget")
+                .map { field(.object($0.params), "targetId") == .string("T-OWNED-1") } == true)
+    let blocked = try? await core.handle("perform", .object([
+        "session": .string("s1"), "command": .string("click"),
+        "options": .object(["ref": .string("0.6")])]))
+    check("automation paused during handoff",
+          blocked == nil || field(blocked!, "ok") != .bool(true))
+    page.visible = true
+    let resumeVisible = try await core.handle("resume", .object(["session": .string("s1")]))
+    check("visible tab reports awaiting_background",
+          field(resumeVisible, "handoff") == .string("awaiting_background"))
+    check("no activateTarget was sent for a user tab",
+          transport.sent("Target.activateTarget").count == 1)
+    page.visible = false
+    let resumed = try await core.handle("resume", .object(["session": .string("s1")]))
+    check("hidden tab resumes to background + reassess",
+          field(resumed, "ok") == .bool(true)
+            && field(resumed, "handoff") == .string("background"))
+    let close = try await core.handle("close-session", .object(["session": .string("s1")]))
+    check("close-session closes the owned target by receipt id",
+          transport.sent("Target.closeTarget").contains {
+              field(.object($0.params), "targetId") == .string("T-OWNED-1") })
+    let closeReplay = try await core.handle("close-session", .object(["session": .string("s1")]))
+    check("confirmed close replay returns its settled receipt", closeReplay == close)
+    check("close report confirms cleanup",
+          field(close, "cleanupConfirmed") == .bool(true)
+            && arrayField(close, "uncertainTargets").isEmpty)
+    check("STILL no forbidden methods after full lifecycle",
+          transport.calls.allSatisfy { !forbidden.contains($0.method) },
+          "\(transport.calls.map { $0.method })")
+    check("every activateTarget ever sent named the owned receipt id",
+          transport.sent("Target.activateTarget").allSatisfy {
+              field(.object($0.params), "targetId") == .string("T-OWNED-1") })
+    transport.finish()
+    try await Task.sleep(for: .milliseconds(200))
+    journal = await core.journalSnapshot
+    check("disconnect keeps live browser generation uncertain",
+          journal.generation?.gone == false)
+    let goneErr = try? await core.handle("perform", .object([
+        "session": .string("s1"), "command": .string("observe"), "options": .object([:])]))
+    check("dead browser reports browser_gone honestly",
+          goneErr == nil || field(goneErr!, "ok") != .bool(true))
+}
+
+do {
+    let identity = ProcessIdentity(pid: 4242, start: 500)
+    let unknown = DisplayHost.Probe(startTime: { _ in nil }, signal: { _, _ in 0 })
+    check("missing process metadata does not prove browser death", !SessionProcess.isDead(identity, probe: unknown))
+    let replaced = DisplayHost.Probe(startTime: { _ in 501 }, signal: { _, _ in 0 })
+    check("a changed start time proves the original browser died", SessionProcess.isDead(identity, probe: replaced))
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("asr-corrupt-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let bytes = Data("invalid journal evidence".utf8)
+    try bytes.write(to: dir.appendingPathComponent("journal.json"))
+    let core = try? SessionCore(config: .init(brokerKey: "sb-corrupt", mode: .shared, chromeRoot: dir, brokerDir: dir))
+    check("unreadable journals refuse startup", core == nil)
+    check("unreadable journal evidence is preserved", (try? Data(contentsOf: dir.appendingPathComponent("journal.json"))) == bytes)
+}
+
+// MARK: 15. Chrome session broker IPC - real broker process
+
+do {
+    guard let brokerBinary = SessionBroker.locate() else {
+        check("session broker binary exists next to CLI", false, "agentspace-session-broker not built")
+        throw AgentSpaceError("test_setup", "broker binary missing")
+    }
+    check("session broker binary located", FileManager.default.isExecutableFile(atPath: brokerBinary.path))
+    let dir = NSTemporaryDirectory() + "asr-broker-\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12))"
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
+                                            attributes: [.posixPermissions: 0o700])
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let brokerDir = dir + "/broker"
+    try FileManager.default.createDirectory(atPath: brokerDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    let chromeRoot = dir + "/ChromeRoot"
+    try FileManager.default.createDirectory(atPath: chromeRoot, withIntermediateDirectories: true)
+    let socketPath = dir + "/sb.sock"
+    let proc = Process()
+    proc.executableURL = brokerBinary
+    proc.arguments = ["--key", "sb-regtest", "--mode", "existing",
+                      "--chrome-root", chromeRoot, "--broker-dir", brokerDir,
+                      "--socket", socketPath, "--janitor-interval", "0.3",
+                      "--connect-timeout", "1"]
+    proc.environment = ["PATH": "/usr/bin:/bin"]
+    proc.standardInput = FileHandle.nullDevice
+    proc.standardOutput = FileHandle.nullDevice
+    proc.standardError = FileHandle.nullDevice
+    try proc.run()
+    var recordData: Data?
+    for _ in 0..<100 where recordData == nil {
+        usleep(100_000)
+        recordData = try? Data(contentsOf: URL(fileURLWithPath: brokerDir + "/broker.json"))
+    }
+    check("broker wrote its identity record", recordData != nil)
+    let record = recordData.flatMap { try? JSONDecoder().decode(BrokerRecord.self, from: $0) }
+    check("broker record matches spawned pid",
+          record?.pid == proc.processIdentifier && record != nil)
+    let tokenPath = brokerDir + "/broker-token"
+    var token = ""
+    for _ in 0..<50 where token.isEmpty {
+        usleep(50_000)
+        token = (try? String(contentsOfFile: tokenPath))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+    check("broker token is 0600 and 32+ hex",
+          token.count >= 32 && token.allSatisfy(\.isHexDigit)
+            && (stat0(URL(fileURLWithPath: tokenPath)) == 0o600))
+    let bad = try? BrokerIPC.request(socketPath: socketPath, token: "wrong", op: "status", timeout: 3)
+    check("bad token rejected",
+          bad.map { field($0, "ok") == .bool(false)
+                    && stringField(field($0, "error"), "code") == "auth_failed" } == true)
+    let hello = try? BrokerIPC.request(socketPath: socketPath, token: token, op: "hello", timeout: 3)
+    check("hello preserves setup failure",
+          hello.map { stringField(field($0, "error"), "code") == "chrome_not_configured" } == true)
+    let status = try? BrokerIPC.request(socketPath: socketPath, token: token, op: "status", timeout: 3)
+    check("status reports degraded honestly (no browser bound)",
+          status.map { field($0, "ok") == .bool(true) } == true)
+    let unknown = try? BrokerIPC.request(socketPath: socketPath, token: token, op: "nope", timeout: 3)
+    check("unknown op rejected",
+          unknown.map { stringField(field($0, "error"), "code") == "unknown_op" } == true)
+    let big = String(repeating: "A", count: 1_100_000)
+    let oversized = try? BrokerIPC.request(socketPath: socketPath, token: token, op: "status",
+                                           fields: ["blob": .string(big)], timeout: 5)
+    check("oversized frame refused by client cap",
+          oversized == nil || stringField(field(oversized!, "error"), "code") == "request_too_large")
+    let proc2 = Process()
+    proc2.executableURL = brokerBinary
+    proc2.arguments = ["--key", "sb-regtest", "--mode", "existing",
+                       "--chrome-root", chromeRoot, "--broker-dir", brokerDir,
+                       "--socket", socketPath]
+    proc2.environment = ["PATH": "/usr/bin:/bin"]
+    proc2.standardInput = FileHandle.nullDevice
+    proc2.standardOutput = FileHandle.nullDevice
+    proc2.standardError = FileHandle.nullDevice
+    try proc2.run()
+    proc2.waitUntilExit()
+    check("second broker on the same key refused (singleton lock)",
+          proc2.terminationStatus != 0)
+    check("first broker still alive after the conflict",
+          kill(proc.processIdentifier, 0) == 0)
+    _ = try? BrokerIPC.call(socketPath: socketPath, token: token, op: "shutdown", timeout: 5)
+    var gone = false
+    for _ in 0..<50 where !gone { usleep(100_000); gone = kill(proc.processIdentifier, 0) != 0 }
+    check("broker exits on authenticated shutdown", gone)
+    check("broker unlinked its socket", !FileManager.default.fileExists(atPath: socketPath))
+    let proc3 = Process()
+    proc3.executableURL = brokerBinary
+    proc3.arguments = ["--key", "sb-janitor", "--mode", "existing",
+                       "--chrome-root", chromeRoot, "--broker-dir", dir + "/broker2",
+                       "--socket", dir + "/sb2.sock", "--janitor-interval", "0.3"]
+    proc3.environment = ["PATH": "/usr/bin:/bin"]
+    proc3.standardInput = FileHandle.nullDevice
+    proc3.standardOutput = FileHandle.nullDevice
+    proc3.standardError = FileHandle.nullDevice
+    try proc3.run()
+    var seen = false
+    for _ in 0..<100 where !seen { usleep(50_000); seen = FileManager.default.fileExists(atPath: dir + "/sb2.sock") }
+    check("janitor test broker bound its socket", seen)
+    unlink(dir + "/sb2.sock")
+    proc3.waitUntilExit()
+    check("janitor exits broker when socket disappears",
+          proc3.terminationReason == .exit && proc3.terminationStatus == 0,
+          "status \(proc3.terminationStatus)")
+    if let logData = try? Data(contentsOf: URL(fileURLWithPath: brokerDir + "/session-log.jsonl")),
+       !logData.isEmpty {
+        let lines = String(decoding: logData, as: UTF8.self).split(separator: "\n")
+        let allowed: Set<String> = ["ts", "kind", "op", "ok", "code", "mode", "session",
+                                    "site", "alias", "state", "handoff", "access", "identity",
+                                    "count", "file", "pid"]
+        let allClean = lines.allSatisfy { line in
+            guard let parsed = try? JSONDecoder().decode(JSONValue.self, from: Data(line.utf8)),
+                  case .object(let o) = parsed else { return false }
+            return o.keys.allSatisfy(allowed.contains)
+        }
+        check("session log envelope is allowlisted only", allClean)
+    }
+}
+
+// MARK: 16. Access + identity classifier - evidence rules, no guessing
+
+do {
+    func facts(_ markerPairs: [(String, String)], url: String = "http://127.0.0.1/app",
+               password: Bool = false, loginPath: Bool = false) -> PageFacts {
+        PageFacts(url: url, host: URL(string: url)?.host() ?? "",
+                  title: "t", hasPasswordField: password,
+                  loginPathHint: loginPath, markers: Dictionary(uniqueKeysWithValues: markerPairs))
+    }
+    let hash = SessionBroker.accountDigest
+    let expected = hash("alice@fixture.io", "salt")
+    let good = SiteAccess.assess(facts([("fixtureSignedIn", "1"), ("fixtureAccount", "alice@fixture.io")]),
+                               site: "fixture", expectedDigest: expected) { hash($0, "salt") }
+    check("readback match verifies", good.access == .accessible && good.identity == .verified,
+          "\(good)")
+    check("verification method names the site readback",
+          good.identityMethod == "fixture-account-readback")
+    let wrong = SiteAccess.assess(facts([("fixtureSignedIn", "1"), ("fixtureAccount", "bob@fixture.io")]),
+                                site: "fixture", expectedDigest: expected) { hash($0, "salt") }
+    check("readback mismatch is mismatch, never verified",
+          wrong.identity == .mismatch && wrong.access == .accessible, "\(wrong)")
+    let silent = SiteAccess.assess(facts([("fixtureSignedIn", "1")]),
+                                 site: "fixture", expectedDigest: expected) { hash($0, "salt") }
+    check("missing readback with constraint is unknown, not verified",
+          silent.identity == .unknown && silent.access == .accessible, "\(silent)")
+    let slotted = SiteAccess.assess(facts([("fixtureSignedIn", "1")],
+                                        url: "http://127.0.0.1/u/2/app?authuser=2"),
+                                    site: "fixture", expectedDigest: expected) { hash($0, "salt") }
+    check("URL account slot can never verify identity",
+          slotted.identity == .unknown, "\(slotted)")
+    let wall = SiteAccess.assess(facts([("fixtureLogin", "1")], password: true),
+                                 site: "fixture", expectedDigest: nil) { hash($0, "salt") }
+    check("fixture login marker -> login_required",
+          wall.access == .loginRequired && wall.evidence.contains("fixture-login-marker"))
+    let pw = SiteAccess.assess(facts([], password: true), site: nil,
+                               expectedDigest: nil) { hash($0, "salt") }
+    check("a password field alone is a login wall, not an account",
+          pw.access == .loginRequired && pw.identity == .notRequired)
+    let generic = SiteAccess.assess(facts([("fixtureSignedIn", "1")]), site: "github",
+                                    expectedDigest: expected) { hash($0, "salt") }
+    check("unsupported site stays unknown even with stray markers",
+          generic.access == .unknown && generic.identity == .unknown, "\(generic)")
+    let noSite = SiteAccess.assess(facts([("fixtureSignedIn", "1")]), site: nil,
+                                   expectedDigest: expected) { hash($0, "salt") }
+    check("fixture markers mean nothing without the fixture host rule",
+          noSite.access == .unknown && noSite.identity == .unknown, "\(noSite)")
+    let crossHost = SiteAccess.assess(facts([("fixtureSignedIn", "1"), ("fixtureAccount", "alice@fixture.io")],
+                                          url: "https://mail.google.com/mail/u/0/"),
+                                      site: "fixture", expectedDigest: expected) { hash($0, "salt") }
+    check("site rule does not apply off its declared hosts",
+          crossHost.access == .unknown && crossHost.identity == .unknown, "\(crossHost)")
+    check("gmail normalization drops dots and +tags",
+          AccountConstraint.normalize("Al.Ice+work@Gmail.com") == "alice@gmail.com")
+    check("non-gmail domains keep dots",
+          AccountConstraint.normalize("al.ice@fixture.io") == "al.ice@fixture.io")
+    check("account digest never embeds the plaintext",
+          !hash("alice@fixture.io", "salt").contains("alice"))
+    let gmailWall = SiteAccess.assess(facts([], url: "https://accounts.google.com/signin"),
+                                      site: "gmail", expectedDigest: nil) { hash($0, "salt") }
+    check("supported-site login host -> login_required",
+          gmailWall.access == .loginRequired && gmailWall.evidence.contains("login-host"))
 }
 
 // MARK: Report

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>AgentSpace Session Fixture</title>
+<style>
+body {font: 18px system-ui; margin: 32px; max-width: 800px}
+label {display: block; margin: 16px 0}
+input, button {font: inherit}
+</style>
+<body data-fixture-auth="signed-in">
+<div data-fixture-account="alice@fixture.io"></div>
+<h1>AgentSpace session app</h1>
+<label>Session input <input id="session-input" aria-label="Session input"></label>
+<button id="session-button" onclick="document.getElementById('result-label').textContent='Session clicked';this.textContent='Clicked'">Session button</button>
+<p id="result-label" role="status" aria-live="polite">Not clicked</p>
+<a id="blank-link" href="session-popup-target.html" target="_blank">Opens in a new tab</a>
+<button id="popup-button" onclick="window.open('session-popup-target.html','p','width=300,height=200')">Open popup via window.open</button>
+<a id="download-link" href="session-download.bin" download>Download attachment</a>
+</body>
+</html>

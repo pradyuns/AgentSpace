@@ -5,6 +5,9 @@ the Mac. A scripted human types and moves the mouse, and a monitor records the
 front app, the cursor and every global input event.
 
 Latest numbers: [RESULTS.md](RESULTS.md).
+Chrome tasks in those comparisons use the original default disposable profile.
+Authenticated Chrome sessions have separate functional checks below; they
+have not been added to the comparative benchmark.
 
 ## Quick checks
 
@@ -18,11 +21,34 @@ PYTHONPATH=Evals python3 -m unittest test_display_host test_mcp_adapter
 
 `swift test` needs full Xcode, since Command Line Tools don't include XCTest.
 
-## Full run
+## Authenticated Chrome session checks
 
-> [!WARNING]
-> The scripted human controls the real mouse and keyboard, and cold starts quit
-> TextEdit, Chrome and Safari. Use a VM or a spare user account.
+Build the CLI, broker, and regression runner, then run the session and
+transport tests against isolated Chrome profiles:
+
+```sh
+swift build
+.build/debug/agentspace-regression
+python3 -m unittest Evals.test_chrome_session Evals.test_session_transport -v
+```
+
+To include the visible login-handoff and concurrent control-tab checks:
+
+```sh
+AGENTSPACE_TEST_HEADED=1 python3 -m unittest Evals.test_chrome_session Evals.test_session_transport -v
+```
+
+The headed run opens fixture Chrome windows and intentionally changes focus
+during setup and handoff. It checks cookie-backed login persistence,
+account changes and expiry, popup and download effects, child frames after
+resume, cleanup, and the human control tab's selection, input, and scroll.
+It uses the real CLI and MCP surfaces. Transport-failure cases use a fake
+socket. It does not use personal profiles or establish live Gmail, MFA,
+keychain-prompt, or Chrome consent behavior.
+
+See the [Chrome session setup and limits](../README.md#chrome-sessions-opt-in).
+
+## Full run
 
 Grant your terminal Accessibility, Screen Recording and Input Monitoring, and
 install Google Chrome. Then:

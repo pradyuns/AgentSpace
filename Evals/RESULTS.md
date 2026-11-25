@@ -1,9 +1,14 @@
 # Results
 
-Measured on 23 November 2026 on one Mac (macOS 26.6.2, 12 cores). A scripted
-human typed and moved the mouse during every trial. Each tool ran each scenario
-3 times from a **cold** start (apps closed) and 3 times from a **warm** start
-(apps already open).
+Measured on 23 November 2026 on one Mac (macOS 26.6.2, 12 cores). A script
+replicating human typing and mouse movement ran during every trial. Each tool
+ran each scenario 3 times from a **cold** start (apps closed) and 3 times from
+a **warm** start (apps already open).
+
+Chrome results below use the default disposable profile. The later
+opt-in existing-Chrome and dedicated-profile modes were checked separately
+for functionality and interference, without rerunning this comparison.
+See [session checks](README.md#authenticated-chrome-session-checks).
 
 ## Complete workflows
 

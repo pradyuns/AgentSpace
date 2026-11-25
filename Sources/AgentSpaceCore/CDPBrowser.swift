@@ -66,7 +66,7 @@ final class CDPBrowser {
         } catch { client.socket.cancel(with: .goingAway, reason: nil); throw error }
     }
 
-    static func debugEndpoint(_ contents: String) -> URL? {
+    nonisolated static func debugEndpoint(_ contents: String) -> URL? {
         let lines = contents.split(separator: "\n")
         guard lines.count == 2, let port = Int(lines[0]), (1...65535).contains(port),
               lines[1].hasPrefix("/devtools/browser/"),
@@ -260,7 +260,7 @@ final class CDPBrowser {
         return field(field(reply, "result"), "value")
     }
 
-    static func tree(_ response: JSONValue, limit: Int) -> ElementNode {
+    nonisolated static func tree(_ response: JSONValue, limit: Int) -> ElementNode {
         let roles = ["RootWebArea": "AXWebArea", "textbox": "AXTextField", "button": "AXButton", "checkbox": "AXCheckBox",
                      "link": "AXLink", "StaticText": "AXStaticText", "heading": "AXHeading", "combobox": "AXComboBox"]
         let children = array(response, "nodes").compactMap { item -> ElementNode? in

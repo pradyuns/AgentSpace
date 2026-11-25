@@ -29,6 +29,9 @@ public final class WorkspaceController {
     public init(store:StateStore) {self.store=store}
 
     public func run(_ command:String, workspace name:String, options:CommandOptions) async -> JSONValue {
+        let previousWorkspace=try? store.load(name)
+        let sessionWorkspace=options["chrome-session"] != nil || command == "session-handoff" || command == "session-resume"
+            || previousWorkspace?.chromeSession != nil || previousWorkspace?.abandonedChromeSession != nil
         let before=FocusGuard.snapshot();let start=ContinuousClock.now
         var method="none"
         var ok=true
@@ -41,11 +44,15 @@ public final class WorkspaceController {
             ok=false
             let error=error as? AgentSpaceError ?? AgentSpaceError("operation_failed",String(describing:error))
             result = .object(["code":.string(error.code),"message":.string(error.description)])
+            if let details = error.details {
+                result = .object(["code":.string(error.code),"message":.string(error.description),"details":details])
+            }
         }
         let after=FocusGuard.snapshot()
         let elapsed=start.duration(to:.now)
         let ms=Double(elapsed.components.seconds)*1000+Double(elapsed.components.attoseconds)/1e15
-        let log=ActionLog(timestamp:Date(),action:command,method:method,latencyMs:ms,result:.object(["ok":.bool(ok),"details":result]),before:before,after:after)
+        let details=sessionWorkspace ? ChromeSession.project(result) : result
+        let log=ActionLog(timestamp:Date(),action:command,method:method,latencyMs:ms,result:.object(["ok":.bool(ok),"details":details]),before:before,after:after)
         do {
             if (try? store.load(name)) != nil {try store.append(log,workspace:name)}
         } catch {
@@ -93,11 +100,23 @@ public final class WorkspaceController {
                                  "virtualDisplayAPI":.string(SelfTest.virtualDisplayAPIStatus()),
                                  "note":.string("AgentSpace-owned helper, built next to agentspace")]),
                 "virtualDisplay":vdStatus,
+                "chromeSession":ChromeSession.status(workspace,store:store),
                 "lastActions":.array(try store.recent(name))]))
         }
         if command=="stop-workspace" {return try await stop(&workspace,options:o)}
         guard !workspace.stopped else {throw AgentSpaceError("workspace_stopped","Create a new workspace; this workspace has been stopped")}
         if command=="launch-app" {return try await launchApp(&workspace,options:o)}
+        if command=="session-handoff" {return try await ChromeSession.handoff(&workspace,store:store)}
+        if command=="session-resume" {return try await ChromeSession.resume(&workspace,store:store)}
+        if workspace.chromeSession != nil {
+            guard ["observe","click","type-text","key","scroll"].contains(command) else {
+                throw AgentSpaceError("unsupported",
+                    "'\(command)' is not available on a chrome-session workspace "
+                    + "(observe/click/type-text/key/scroll, session-handoff, session-resume, "
+                    + "get-status and stop-workspace are)")
+            }
+            return try await ChromeSession.perform(command,workspace:&workspace,options:o,store:store)
+        }
         let backend:BackendKind
         if let raw=workspace.backend {
             guard let kind=BackendKind(rawValue:raw) else {throw AgentSpaceError("state_invalid","workspace.json records unknown backend '\(raw)'")}
@@ -513,13 +532,18 @@ public final class WorkspaceController {
     /// Launch routes through one decision point: the backend and interaction mode are resolved
     /// and persisted before any effect, then dispatch happens on the resolved route only.
     private func launchApp(_ workspace:inout Workspace,options o:CommandOptions) async throws -> (String,JSONValue) {
+        if o["chrome-session"] != nil { _ = try ChromeSession.validateLaunch(o) }
         let decision=try pinRouting(&workspace,options:o)
         let (method,result):(String,JSONValue)
         switch BackendKind(rawValue:decision.resolvedBackend) {
         case .virtualDisplay:
             (method,result)=try await VirtualDisplay.launch(&workspace,options:o,store:store)
         case .cdp:
-            (method,result)=try await CDPBrowser.launch(&workspace,options:o,store:store)
+            if o["chrome-session"] != nil {
+                (method,result)=try await ChromeSession.launch(&workspace,options:o,store:store)
+            } else {
+                (method,result)=try await CDPBrowser.launch(&workspace,options:o,store:store)
+            }
         case .ax, nil:
             guard AXIsProcessTrusted() else {throw AgentSpaceError("accessibility_permission","Accessibility permission is required; grant it to the host process in System Settings")}
             (method,result)=try await launch(&workspace,options:o)
@@ -719,13 +743,17 @@ public final class WorkspaceController {
             if workspace.virtualDisplay != nil {
                 session=try VirtualDisplay.abandon(&workspace,store:store)
             }
+            var chromeSession:JSONValue = .null
+            if workspace.chromeSession != nil {
+                chromeSession = ChromeSession.abandon(&workspace)
+            }
             workspace.stopped=true;workspace.target=nil
             try store.save(workspace)
             return ("abandon.local-only",.object(["sessionDestroyed":.null,"cleanupUnconfirmed":.bool(true),
                 "appsTerminated":.bool(false),
                 "appPIDsNotTerminated":try .encoded(workspace.apps.map(\.pid)),
                 "temporaryDirectoryRetained":.string(workspace.temporaryDirectory),
-                "session":session]))
+                "session":session,"chromeSession":chromeSession]))
         }
         return try await Self.stopSequence(
             terminateApps: {
@@ -764,10 +792,18 @@ public final class WorkspaceController {
                         "unownedPIDsNotTerminated":try .encoded(workspace.apps.filter{!$0.owned}.map(\.pid))]
             },
             destroySession: {
-                guard workspace.virtualDisplay != nil else {return nil}
-                let session=try await VirtualDisplay.destroy(&workspace,store:self.store)
-                try self.store.save(workspace)
-                return ["session":session]
+                var out:[String:JSONValue]=[:]
+                if workspace.virtualDisplay != nil {
+                    let session=try await VirtualDisplay.destroy(&workspace,store:self.store)
+                    try self.store.save(workspace)
+                    out["session"]=session
+                }
+                if workspace.chromeSession != nil {
+                    let session=try await ChromeSession.closeSession(&workspace,store:self.store)
+                    try self.store.save(workspace)
+                    out["chromeSession"]=session
+                }
+                return out.isEmpty ? nil : out
             },
             cleanupLocal: {
                 let temp=URL(fileURLWithPath:workspace.temporaryDirectory,isDirectory:true).standardizedFileURL
